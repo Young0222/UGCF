@@ -55,25 +55,13 @@ class PureMF(BasicModel):
         scores = torch.matmul(users_emb, items_emb.t())
         return self.f(scores)
     
-    def bpr_loss(self, users, pos, neg):
+    def bpr_loss(self, users, pos, neg, batch_i):
         users_emb = self.embedding_user(users.long())
         pos_emb   = self.embedding_item(pos.long())
         neg_emb   = self.embedding_item(neg.long())
-
-        # users_emb =  F.normalize(users_emb, dim=1)
-        # pos_emb =  F.normalize(pos_emb, dim=1)
-        # neg_emb =  F.normalize(neg_emb, dim=1)
-
-        pos_scores = torch.sum(users_emb*pos_emb, dim=1)
-        neg_scores = torch.sum(users_emb*neg_emb, dim=1)
-        # pos_scores = self.f(pos_scores)
-        # neg_scores = self.f(neg_scores)
-        
-        
+        pos_scores = torch.sum( (users_emb*pos_emb) / (torch.norm(users_emb)*torch.norm(pos_emb)), dim=1)
+        neg_scores = torch.sum( (users_emb*neg_emb) / (torch.norm(users_emb)*torch.norm(neg_emb)), dim=1)
         loss = torch.mean(nn.functional.softplus(neg_scores - pos_scores))
-        
-        # eps = 1e-7
-        # loss = torch.mean( - torch.log(pos_scores + eps) - torch.log(1-neg_scores + eps) )
 
         reg_loss = (1/2)*(users_emb.norm(2).pow(2) + pos_emb.norm(2).pow(2) + neg_emb.norm(2).pow(2))/float(len(users))
         return loss, reg_loss
@@ -107,10 +95,6 @@ class LightGCN(BasicModel):
         self.embedding_item = torch.nn.Embedding(
             num_embeddings=self.num_items, embedding_dim=self.latent_dim)
         if self.config['pretrain'] == 0:
-#             nn.init.xavier_uniform_(self.embedding_user.weight, gain=1)
-#             nn.init.xavier_uniform_(self.embedding_item.weight, gain=1)
-#             print('use xavier initilizer')
-# random normal init seems to be a better choice when lightGCN actually don't use any non-linear activation function
             nn.init.normal_(self.embedding_user.weight, std=0.1)
             nn.init.normal_(self.embedding_item.weight, std=0.1)
             world.cprint('use NORMAL distribution initilizer')
@@ -134,11 +118,16 @@ class LightGCN(BasicModel):
             self.Graph, self.rowsum = self.dataset.getSparseGraph_pc()
         elif args.model == 'ours':
             self.Graph = self.dataset.getSparseGraph_lgn()
-            self.embed_user_first = torch.Tensor(np.load('embed_user_'+args.dataset+'.npy'))
-            # self.embed_item_first = torch.Tensor(np.load('embed_user_'+args.dataset+'.npy'))
-            self.embed_item_first = torch.Tensor(np.load('embed_item_'+args.dataset+'.npy'))
-            self.exp_prob = self.f(torch.mm(self.embed_user_first, self.embed_item_first.T))
+            self.embed_user_first = torch.Tensor(np.load('lgn_embed_user_'+args.dataset+'.npy'))
+            self.embed_item_first = torch.Tensor(np.load('lgn_embed_item_'+args.dataset+'.npy'))
+
+            self.sim_score = self.f(torch.mm(self.embed_user_first, self.embed_item_first.T))
+            self.alpha = args.alpha
+            print("alpha: ", self.alpha)
+            self.exp_prob = torch.max(self.alpha * torch.ones([self.num_users, self.num_items]), self.sim_score)
+            print("self.exp_prob, min, max: ", torch.min(self.exp_prob), torch.max(self.exp_prob))
             print("Exposure probability matrix is computed")
+
         print(f"lgn is already to go(dropout:{self.config['dropout']})")
 
     def __dropout_x(self, x, keep_prob):
@@ -181,14 +170,6 @@ class LightGCN(BasicModel):
         
         # APDA
         if args.model == 'lgn-apda':
-            # mat_ones = torch.ones(all_emb.shape[0],all_emb.shape[0]).to(all_emb.device)
-            # mat_norm = torch.norm(all_emb, dim=1)
-            # mat_norm = mat_norm.unsqueeze(1)
-            # mat_norm = torch.mm(mat_norm, mat_norm.T)
-            # mat_C = torch.exp(mat_ones - torch.mm(all_emb, all_emb.T) / mat_norm)
-            # g_droped = torch.sparse.mm(g_droped.t(), mat_C.T)
-            # g_droped = g_droped.t()
-
             all_emb_new = all_emb
             cof_lambda = 0.6
             for layer in range(self.n_layers):
@@ -236,7 +217,7 @@ class LightGCN(BasicModel):
         neg_emb_ego = self.embedding_item(neg_items)
         return users_emb, pos_emb, neg_emb, users_emb_ego, pos_emb_ego, neg_emb_ego
     
-    def bpr_loss(self, users, pos, neg):
+    def bpr_loss(self, users, pos, neg, batch_i):
         (users_emb, pos_emb, neg_emb, 
         userEmb0,  posEmb0, negEmb0) = self.getEmbedding(users.long(), pos.long(), neg.long())
         reg_loss = (1/2)*(userEmb0.norm(2).pow(2) + 
@@ -250,17 +231,7 @@ class LightGCN(BasicModel):
         # Debiased LightGCN
         if args.model == 'ours':
             propensity_scores = 1.0 / self.exp_prob[users.long(), pos.long()].to(pos_scores.device)
-
-            # perfect propensity_scores
-            # like_prob = np.arange(0.11, 0.61, 0.01)
-            # # item_pos_list = np.arange(100, 0, -2) #p=2
-            # item_pos_list = np.arange(394, 0, -8)   #p=8
-            # exp_list = item_pos_list / like_prob
-            # exp_list_tensor = torch.from_numpy(exp_list)
-            # perfect_prob = exp_list_tensor / torch.sum(exp_list_tensor)
-            # propensity_scores = 1.0 / perfect_prob[pos.long()-1].to(pos_scores.device)
-
-            loss = torch.mean(torch.nn.functional.softplus(neg_scores - pos_scores * propensity_scores))
+            loss = torch.mean(propensity_scores * torch.nn.functional.softplus(neg_scores - pos_scores))
         elif args.model == 'lgn-pc':
             pc_alpha = 1.0
             degree_mat = torch.from_numpy(self.rowsum).to(pos_scores.device)
